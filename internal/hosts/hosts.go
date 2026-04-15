@@ -185,6 +185,16 @@ func (f File) backup(existing []byte) error {
 
 // writeAtomic writes via a temp file in the same directory, then renames.
 // This avoids leaving a half-written /etc/hosts if the process is killed.
+//
+// Windows caveat: the system hosts file is typically held open by
+// dnsclient and Defender in a share mode that disallows replacement,
+// so MoveFileEx(REPLACE_EXISTING) returns ERROR_ACCESS_DENIED even for
+// an elevated process. When rename fails, we fall back to writing in
+// place (truncate + write) on the target itself, which Windows allows
+// because dnsclient opens hosts with FILE_SHARE_WRITE. That loses the
+// atomicity guarantee on the failure path — a crash mid-write would
+// leave a truncated hosts — but a readable-but-empty file beats a
+// permanent "Access denied" and we've already taken a backup above.
 func writeAtomic(path string, data []byte) error {
 	dir := filepath.Dir(path)
 	tmp, err := os.CreateTemp(dir, ".hosts-*")
@@ -208,9 +218,24 @@ func writeAtomic(path string, data []byte) error {
 		cleanup()
 		return err
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		cleanup()
-		return fmt.Errorf("rename over %s: %w", path, err)
+	if err := os.Rename(tmpPath, path); err == nil {
+		return nil
+	}
+	// Rename failed — clean up the tmp we just wrote and try an
+	// in-place write. We keep the original rename error so we can
+	// include it in the final error message if the fallback also fails.
+	renameErr := err
+	cleanup()
+
+	// Some systems set FILE_ATTRIBUTE_READONLY on hosts; on Windows
+	// os.Chmod clears READONLY when the mode has any write bit set.
+	// On Unix this is a plain mode change — cheap and idempotent.
+	_ = os.Chmod(path, 0o644)
+
+	// os.WriteFile opens with O_WRONLY|O_CREATE|O_TRUNC, which Windows
+	// allows as long as existing holders used FILE_SHARE_WRITE.
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		return fmt.Errorf("write %s: rename failed (%v) and in-place write failed (%w)", path, renameErr, err)
 	}
 	return nil
 }

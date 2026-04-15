@@ -52,12 +52,20 @@ func ShouldElevate(err error) bool {
 	return os.IsPermission(err)
 }
 
-// Run re-executes the current binary under UAC to perform the job.
+// Run re-executes an ec2hosts binary under UAC to perform the job.
 // ShellExecuteEx's "runas" verb triggers the UAC prompt. The job is
 // passed via a temp JSON file instead of stdin because stdin cannot
 // be piped into an elevated child under this API.
+//
+// Target selection: we prefer a sibling `ec2hosts.exe` (the CLI) next
+// to the running binary, falling back to the running binary itself.
+// That matters for the GUI: its entrypoint does not parse the hidden
+// `__write-hosts` subcommand, so re-execing itself would just launch
+// another Wails window as Administrator without writing the hosts
+// file. The NSIS installer bundles the CLI alongside the GUI for
+// exactly this purpose.
 func Run(job WriteJob) error {
-	self, err := os.Executable()
+	self, err := resolveElevationTarget()
 	if err != nil {
 		return fmt.Errorf("locate self: %w", err)
 	}
@@ -119,9 +127,38 @@ func Run(job WriteJob) error {
 		return fmt.Errorf("get child exit code: %w", err)
 	}
 	if code != 0 {
-		return fmt.Errorf("elevated child exited with code %d", code)
+		// The child can't reach our stderr (ShellExecuteEx discards
+		// it under "runas"), so it writes its error to <job>.err —
+		// read that here to surface the real cause instead of a bare
+		// "exit code 1".
+		if detail, err := os.ReadFile(tmpPath + ".err"); err == nil && len(detail) > 0 {
+			_ = os.Remove(tmpPath + ".err")
+			return fmt.Errorf("hosts write failed: %s", strings.TrimSpace(string(detail)))
+		}
+		return fmt.Errorf("elevated child exited with code %d (no error detail captured)", code)
 	}
 	return nil
+}
+
+// resolveElevationTarget picks the binary to re-exec with UAC. It prefers
+// a sibling `ec2hosts.exe` (the bundled CLI) over the running executable,
+// because only the CLI's main() handles the hidden `__write-hosts`
+// subcommand that the elevated child runs. Falls back to os.Executable()
+// when no sibling CLI is present (i.e. when the CLI itself is running,
+// or during `wails dev` without a staged CLI binary).
+func resolveElevationTarget() (string, error) {
+	self, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	sibling := filepath.Join(filepath.Dir(self), "ec2hosts.exe")
+	if strings.EqualFold(sibling, self) {
+		return self, nil
+	}
+	if _, err := os.Stat(sibling); err == nil {
+		return sibling, nil
+	}
+	return self, nil
 }
 
 // quoteArg wraps s in double quotes if it contains spaces or quotes, so

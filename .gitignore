@@ -31,6 +31,19 @@ cmd/gui/frontend/wailsjs/
 # npm
 cmd/gui/frontend/node_modules/
 cmd/gui/frontend/.vite/
+cmd/gui/frontend/package.json.md5
 
-# Wails build output
+# Wails build output + per-build regenerated assets (icons, helper .nsh,
+# installer scratch). Keep the hand-authored project.nsi tracked.
 cmd/gui/build/bin/
+cmd/gui/build/appicon.png
+cmd/gui/build/windows/icon.ico
+cmd/gui/build/windows/installer/wails_tools.nsh
+cmd/gui/build/windows/installer/tmp/
+# Staged by CI from the repo root before `wails build -nsis`, should not
+# be committed — the source of truth is /config.yaml.example.
+cmd/gui/build/windows/installer/config.yaml.example
+
+# Stray build binaries at repo root (accidental `go build` from cwd).
+/cli.exe
+/gui.exe

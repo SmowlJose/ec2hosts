@@ -1,10 +1,11 @@
 <script setup>
-import { onMounted, computed } from 'vue'
+import { onMounted, onBeforeUnmount, computed } from 'vue'
 import { useAppStore } from './stores/app'
 import EC2StatusBar from './components/EC2StatusBar.vue'
 import ActionButtons from './components/ActionButtons.vue'
 import HostsTable from './components/HostsTable.vue'
 import LogPanel from './components/LogPanel.vue'
+import AWSCredentialsDialog from './components/AWSCredentialsDialog.vue'
 
 const store = useAppStore()
 
@@ -17,7 +18,17 @@ onMounted(async () => {
   await store.loadConfigInfo()
   if (!configMissing.value) {
     await store.refresh()
+    // Kick off background polling so the table tracks external state
+    // changes (someone stopping the instance via AWS console) and so
+    // Start & apply feedback doesn't depend on the user mashing Refresh.
+    store.startPolling()
   }
+})
+
+onBeforeUnmount(() => {
+  // Covers `wails dev` hot reloads and the closing window lifecycle;
+  // prevents the poller from leaking onto subsequent mounts.
+  store.stopPolling()
 })
 </script>
 
@@ -31,11 +42,15 @@ onMounted(async () => {
         </span>
       </div>
       <div class="actions">
+        <a @click="store.openCredsDialog">AWS credentials</a>
+        <span class="sep">·</span>
         <a @click="store.openConfigInEditor">Edit config</a>
         <span class="sep">·</span>
         <a @click="store.openConfigFolder">Open folder</a>
       </div>
     </header>
+
+    <AWSCredentialsDialog />
 
     <main v-if="configMissing" class="config-missing">
       <h2>config.yaml not found</h2>
