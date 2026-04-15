@@ -98,7 +98,10 @@ jobs:
 
       - name: Build GUI + NSIS installer
         working-directory: cmd/gui
-        run: wails build -platform windows/amd64 -nsis -clean
+        # No -clean: we pre-stage the CLI binary into build/bin/ and the
+        # wails -clean flag would wipe it before the NSIS step. CI checkouts
+        # are fresh, so there is nothing to clean anyway.
+        run: wails build -platform windows/amd64 -nsis
 
       - name: Show produced artifacts
         shell: bash
