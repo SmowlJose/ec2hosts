@@ -1,0 +1,133 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Build the CLI for every supported platform. Small, fast, pure Go.
+  # ---------------------------------------------------------------------
+  cli-build:
+    name: cli / ${{ matrix.goos }}-${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build CLI
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          ext=""
+          if [ "${GOOS}" = "windows" ]; then ext=".exe"; fi
+          out="dist/ec2hosts-${GOOS}-${GOARCH}${ext}"
+          go build -trimpath -ldflags '-s -w' -o "${out}" ./cmd/cli
+          ls -la "${out}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------
+  # Build the Windows GUI + NSIS installer. Must run on a Windows runner
+  # because Wails/WebView2 need native toolchains.
+  # ---------------------------------------------------------------------
+  gui-build:
+    name: gui / windows-amd64
+    runs-on: windows-latest
+    needs: cli-build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download CLI windows-amd64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-windows-amd64
+          path: cli-artifact
+
+      - name: Stage CLI binary for NSIS
+        shell: bash
+        run: |
+          # The NSIS script (cmd/gui/build/windows/installer/project.nsi)
+          # pulls the CLI via: File "..\..\bin\ec2hosts.exe"
+          mkdir -p cmd/gui/build/bin
+          cp cli-artifact/ec2hosts-windows-amd64.exe cmd/gui/build/bin/ec2hosts.exe
+          # And the example config is seeded from a file next to the .nsi.
+          cp config.yaml.example cmd/gui/build/windows/installer/config.yaml.example
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.9.2
+
+      - name: Build GUI + NSIS installer
+        working-directory: cmd/gui
+        run: wails build -platform windows/amd64 -nsis -clean
+
+      - name: Show produced artifacts
+        shell: bash
+        working-directory: cmd/gui/build/bin
+        run: ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gui-windows-amd64
+          path: |
+            cmd/gui/build/bin/ec2hosts-gui.exe
+            cmd/gui/build/bin/ec2hosts-gui-amd64-installer.exe
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------
+  # Collect every artifact and attach it to the GitHub Release.
+  # ---------------------------------------------------------------------
+  release:
+    name: publish release
+    runs-on: ubuntu-latest
+    needs: [cli-build, gui-build]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts for release
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}

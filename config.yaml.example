@@ -1,0 +1,44 @@
+aws:
+  region: eu-west-1
+  # profile: my-profile   # optional; falls back to AWS_PROFILE / default
+
+# hosts_file: /etc/hosts # optional (autodetected)
+
+marker_tag: ec2hosts # Tag used in the BEGIN/END markers that delimit the managed block, change it if you run several copies on the same machine.
+
+# Target used by any host entry that does not set `target:` explicitly.
+default_target: ec2
+
+# Named IP sources. Each host picks one of these.
+targets:
+  ec2:
+    type: ec2
+    instance_id: i-0123456789abcdef0 # <- change this to your instance ID
+  local:
+    type: static
+    ip: 127.0.0.1
+  # teammate:
+  #   type: static
+  #   ip: 10.0.0.42
+
+# Per-host routing. Hosts without `target:` inherit default_target.
+hosts:
+  - host: live-local.smowltech.net
+    target: local # <- this one points to your own machine
+  - host: admin-local.smowltech.net
+    target: ec2 # <- ec2 is the default (default_target)
+  - host: api-local.smowltech.net
+  - host: api-sessions-local.smowltech.net
+  - host: customer-local.smowltech.net
+  - host: front-results-local.smowltech.net
+  - host: lti-smowl-global-local.smowltech.net
+  - host: resources-local.smowltech.net
+  - host: results-api-local.smowltech.net
+  - host: results-local.smowltech.net
+  - host: reports-local.smowltech.net
+  - host: swl-local.smowltech.net
+  - host: swl-scm-local.smowltech.net
+  - host: webapp-local.smowltech.net        
+  - host: jose-g-local.smowltech.com
+  - host: api-private-local.smowltech.net
+  - host: dashboard-api-local.smowltech.net
