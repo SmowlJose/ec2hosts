@@ -111,9 +111,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: gui-windows-amd64
+          # The installer is named from ${INFO_PROJECTNAME} in wails.json
+          # (= "ec2hosts"), not from outputfilename (= "ec2hosts-gui").
           path: |
             cmd/gui/build/bin/ec2hosts-gui.exe
-            cmd/gui/build/bin/ec2hosts-gui-amd64-installer.exe
+            cmd/gui/build/bin/ec2hosts-amd64-installer.exe
           if-no-files-found: error
           retention-days: 1
 
