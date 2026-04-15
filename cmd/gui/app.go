@@ -12,6 +12,7 @@ import (
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"github.com/SmowlJose/ec2hosts/internal/awscreds"
 	"github.com/SmowlJose/ec2hosts/internal/awsec2"
 	"github.com/SmowlJose/ec2hosts/internal/config"
 	"github.com/SmowlJose/ec2hosts/internal/elevate"
@@ -221,6 +222,158 @@ func (a *App) Down() error {
 	}
 	a.emit("progress", "done")
 	return nil
+}
+
+// ---- AWS credentials setup (opt-in helper for users who don't want to
+//      install the AWS CLI just to populate ~/.aws/credentials) ----
+
+// AWSCredsStatusDTO mirrors awscreds.Status with a field layout that is
+// friendlier for a Wails-generated TypeScript consumer. Paths are sent
+// so the UI can show "stored at C:\Users\...\.aws\credentials" and
+// offer a "reveal in Explorer" link.
+type AWSCredsStatusDTO struct {
+	CredentialsPath    string   `json:"credentialsPath"`
+	ConfigPath         string   `json:"configPath"`
+	CredentialsFileOK  bool     `json:"credentialsFileOk"`
+	ConfigFileOK       bool     `json:"configFileOk"`
+	ProfileExists      bool     `json:"profileExists"`
+	Profiles           []string `json:"profiles"`
+	MaskedAccessKeyID  string   `json:"maskedAccessKeyId"`
+	HasSecretAccessKey bool     `json:"hasSecretAccessKey"`
+	HasSessionToken    bool     `json:"hasSessionToken"`
+	Region             string   `json:"region"`
+	ActiveProfile      string   `json:"activeProfile"` // echoed back so the UI knows which one we inspected
+}
+
+// AWSCredsInputDTO is what the frontend sends for Test / Save. Using a
+// single DTO instead of a long parameter list keeps the generated TS
+// binding readable and forward-compatible.
+type AWSCredsInputDTO struct {
+	Profile         string `json:"profile"`
+	AccessKeyID     string `json:"accessKeyId"`
+	SecretAccessKey string `json:"secretAccessKey"`
+	SessionToken    string `json:"sessionToken"`
+	Region          string `json:"region"`
+}
+
+// AWSCredsTestResultDTO is the "who am I?" payload returned after a
+// successful STS GetCallerIdentity probe. The frontend renders it as
+// "Signed in as <arn> (account 1234...)".
+type AWSCredsTestResultDTO struct {
+	Account string `json:"account"`
+	ARN     string `json:"arn"`
+	UserID  string `json:"userId"`
+}
+
+// awsDefaultProfile picks the right profile name for status/test calls:
+// whatever config.yaml declares, or "default" if unset. Keeping this in
+// one place means the dialog and the runtime clients never disagree
+// about which profile they are inspecting.
+func (a *App) awsDefaultProfile() string {
+	if cfg, err := a.loadConfig(); err == nil && cfg.AWS.Profile != "" {
+		return cfg.AWS.Profile
+	}
+	return "default"
+}
+
+func (a *App) awsDefaultRegion() string {
+	if cfg, err := a.loadConfig(); err == nil {
+		return cfg.AWS.Region
+	}
+	return ""
+}
+
+// AWSCredsStatus inspects ~/.aws/credentials and ~/.aws/config for the
+// profile referenced by config.yaml (or "default") and returns what the
+// dialog needs to render: exists? masked key? which region?
+func (a *App) AWSCredsStatus() (AWSCredsStatusDTO, error) {
+	profile := a.awsDefaultProfile()
+	s, err := awscreds.Load(profile)
+	if err != nil {
+		return AWSCredsStatusDTO{}, err
+	}
+	// Region falls back to config.yaml's aws.region when the on-disk
+	// ~/.aws/config does not carry one for this profile — the UI should
+	// still show the user "which region we'll hit".
+	region := s.Region
+	if region == "" {
+		region = a.awsDefaultRegion()
+	}
+	return AWSCredsStatusDTO{
+		CredentialsPath:    s.CredentialsPath,
+		ConfigPath:         s.ConfigPath,
+		CredentialsFileOK:  s.CredentialsFileOK,
+		ConfigFileOK:       s.ConfigFileOK,
+		ProfileExists:      s.ProfileExists,
+		Profiles:           s.Profiles,
+		MaskedAccessKeyID:  s.MaskedAccessKeyID,
+		HasSecretAccessKey: s.HasSecretAccessKey,
+		HasSessionToken:    s.HasSessionToken,
+		Region:             region,
+		ActiveProfile:      profile,
+	}, nil
+}
+
+// AWSCredsTest validates the credentials the user just typed WITHOUT
+// persisting them. It calls STS:GetCallerIdentity with the static values
+// from the form, so a typo or revoked key fails fast before we touch
+// any file. Returns the identity on success.
+func (a *App) AWSCredsTest(in AWSCredsInputDTO) (AWSCredsTestResultDTO, error) {
+	id, err := awscreds.TestStatic(a.ctx, in.Region, in.AccessKeyID, in.SecretAccessKey, in.SessionToken)
+	if err != nil {
+		return AWSCredsTestResultDTO{}, err
+	}
+	return AWSCredsTestResultDTO{
+		Account: id.Account,
+		ARN:     id.ARN,
+		UserID:  id.UserID,
+	}, nil
+}
+
+// AWSCredsTestSaved re-runs GetCallerIdentity using whatever is in
+// ~/.aws/credentials for the profile. Useful as a health check after
+// save and for the "Test current credentials" affordance on the
+// dialog when a profile already exists.
+func (a *App) AWSCredsTestSaved() (AWSCredsTestResultDTO, error) {
+	id, err := awscreds.TestProfile(a.ctx, a.awsDefaultProfile(), a.awsDefaultRegion())
+	if err != nil {
+		return AWSCredsTestResultDTO{}, err
+	}
+	return AWSCredsTestResultDTO{
+		Account: id.Account,
+		ARN:     id.ARN,
+		UserID:  id.UserID,
+	}, nil
+}
+
+// AWSCredsSave writes the form values to ~/.aws/credentials (and the
+// region to ~/.aws/config when provided). Per-profile; does not
+// disturb other entries. Emits a progress line so the log panel shows
+// what happened.
+func (a *App) AWSCredsSave(in AWSCredsInputDTO) error {
+	a.emit("progress", fmt.Sprintf("saving AWS credentials for profile %q...", in.Profile))
+	if err := awscreds.Save(awscreds.Creds{
+		Profile:         in.Profile,
+		AccessKeyID:     in.AccessKeyID,
+		SecretAccessKey: in.SecretAccessKey,
+		SessionToken:    in.SessionToken,
+		Region:          in.Region,
+	}); err != nil {
+		return err
+	}
+	a.emit("progress", "AWS credentials saved")
+	return nil
+}
+
+// OpenAWSFolder opens the ~/.aws directory in Explorer so curious users
+// can see what we wrote. Creates the directory first if it does not
+// exist yet (e.g. first-run with nothing saved).
+func (a *App) OpenAWSFolder() error {
+	dir := filepath.Dir(awscreds.CredentialsPath())
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	return exec.Command("explorer", dir).Start()
 }
 
 // OpenConfigInEditor opens config.yaml in the user's default associated

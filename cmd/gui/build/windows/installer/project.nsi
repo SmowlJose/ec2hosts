@@ -22,7 +22,12 @@ Unicode true
 ##     the File directive has a stable relative path regardless of cwd.
 ####
 
-!define PRODUCT_EXECUTABLE "${INFO_PROJECTNAME}.exe"
+# The GUI installs as ec2hosts-gui.exe (matches wails.json `outputfilename`)
+# to avoid a name collision with the CLI binary (ec2hosts.exe) that the
+# File directive below drops into the same directory. Prior to this, both
+# files landed as ec2hosts.exe and the CLI silently overwrote the GUI —
+# the installer "succeeded" but the Start-menu shortcut launched the CLI.
+!define PRODUCT_EXECUTABLE "${INFO_PROJECTNAME}-gui.exe"
 !define UNINST_KEY_NAME "${INFO_COMPANYNAME}${INFO_PRODUCTNAME}"
 
 !include "wails_tools.nsh"
