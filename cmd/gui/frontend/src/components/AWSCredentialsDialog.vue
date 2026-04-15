@@ -10,28 +10,17 @@ import {
 } from '../../wailsjs/go/main/App'
 
 /*
- * AWSCredentialsDialog — a Windows-friendly replacement for running
- * `aws configure`. Writes to %USERPROFILE%\.aws\credentials directly.
- *
- * UX goals (in order of priority):
- *
- *   1. Users who already have credentials see that state immediately
- *      ("Signed in as <arn>") without the dialog getting in the way.
- *   2. Users who don't have credentials see a pre-filled form with
- *      sensible defaults (profile name and region taken from
- *      config.yaml) — no typing required for those two fields.
- *   3. The user can Test before Save, so a typo doesn't silently
- *      produce a broken ~/.aws/credentials.
- *   4. Secrets are password-masked and not logged in the event stream.
- *
- * Rendering note: the dialog is its own overlay so it stacks above the
- * main layout even while Up/Down is running. We intentionally do NOT
- * disable the parent with store.busy — those workflows are unrelated.
+ * AWSCredentialsDialog — rewritten against the "operations console"
+ * palette so it doesn't look like a different app. Two-step Test →
+ * Save flow is preserved, but the form now lives inside a right-hand
+ * drawer that slides in over a dimmed backdrop, which reads closer to
+ * a developer-tool inspector panel than a modal. Close on ESC, close
+ * on backdrop click, everything keyboard-navigable.
  */
 
 const store = useAppStore()
 
-// Local form state, reset every time the dialog opens.
+// Form state
 const profile = ref('default')
 const accessKeyId = ref('')
 const secretAccessKey = ref('')
@@ -39,25 +28,22 @@ const sessionToken = ref('')
 const region = ref('')
 const showAdvanced = ref(false)
 
-// Async state: status from backend + the result of a Test/Save click.
-const status = ref(null)         // AWSCredsStatusDTO or null while loading
+// Async state
+const status = ref(null)
 const loading = ref(false)
 const testing = ref(false)
 const saving = ref(false)
-const savedIdentity = ref(null)  // { account, arn, userId } after a successful test
-const savedOk = ref(false)       // true once we've both tested and saved
+const identity = ref(null)
+const savedOk = ref(false)
 const testError = ref('')
 const saveError = ref('')
 
 const firstInput = ref(null)
 
-// Keep the two side effects of opening the dialog colocated so we
-// don't get into a half-open state if one of them throws.
 async function refreshStatus() {
   loading.value = true
   try {
     status.value = await AWSCredsStatus()
-    // Pre-fill the form from whatever the backend knows.
     profile.value = status.value.activeProfile || 'default'
     region.value = status.value.region || ''
   } catch (e) {
@@ -68,18 +54,15 @@ async function refreshStatus() {
   }
 }
 
-// Auto-focus the first editable field (access key ID) when the dialog
-// becomes visible. nextTick lets Vue finish rendering first.
 watch(
   () => store.showCredsDialog,
   async (open) => {
     if (!open) return
-    // Reset transient form state on each open.
     accessKeyId.value = ''
     secretAccessKey.value = ''
     sessionToken.value = ''
     showAdvanced.value = false
-    savedIdentity.value = null
+    identity.value = null
     savedOk.value = false
     testError.value = ''
     saveError.value = ''
@@ -87,8 +70,17 @@ watch(
     await nextTick()
     firstInput.value?.focus()
   },
-  { immediate: false },
 )
+
+// Wire ESC-to-close at the window level so it works even when focus
+// is deep inside a textarea. The listener is attached unconditionally
+// and cheap; we just gate the action by dialog visibility.
+function onKeydown(e) {
+  if (e.key === 'Escape' && store.showCredsDialog) close()
+}
+if (typeof window !== 'undefined') {
+  window.addEventListener('keydown', onKeydown)
+}
 
 const canTest = computed(
   () =>
@@ -98,16 +90,15 @@ const canTest = computed(
     secretAccessKey.value.trim() &&
     profile.value.trim(),
 )
-
-const canSave = computed(() => canTest.value && savedIdentity.value)
+const canSave = computed(() => canTest.value && identity.value)
 
 async function test() {
   testError.value = ''
   saveError.value = ''
-  savedIdentity.value = null
+  identity.value = null
   testing.value = true
   try {
-    savedIdentity.value = await AWSCredsTest({
+    identity.value = await AWSCredsTest({
       profile: profile.value.trim(),
       accessKeyId: accessKeyId.value.trim(),
       secretAccessKey: secretAccessKey.value.trim(),
@@ -133,12 +124,8 @@ async function save() {
       region: region.value.trim(),
     })
     savedOk.value = true
-    // Re-read status so the "Currently configured as …" panel updates
-    // to reflect what we just wrote, and the config info banner in
-    // the main view picks up the new region if it changed.
     await refreshStatus()
     await store.loadConfigInfo()
-    // Auto-refresh EC2 status so the user sees the change take effect.
     store.refresh().catch(() => {})
   } catch (e) {
     saveError.value = humanize(e)
@@ -149,10 +136,10 @@ async function save() {
 
 async function testExisting() {
   testError.value = ''
-  savedIdentity.value = null
+  identity.value = null
   testing.value = true
   try {
-    savedIdentity.value = await AWSCredsTestSaved()
+    identity.value = await AWSCredsTestSaved()
   } catch (e) {
     testError.value = humanize(e)
   } finally {
@@ -160,14 +147,8 @@ async function testExisting() {
   }
 }
 
-function close() {
-  store.showCredsDialog = false
-}
+function close() { store.showCredsDialog = false }
 
-// A best-effort cleanup of AWS SDK error strings. The SDK leaks raw
-// "operation error STS: GetCallerIdentity, https response error..."
-// prose; we trim the most common noise so the surface area the user
-// reads is the actionable part (InvalidClientTokenId, SignatureDoesNotMatch, etc.).
 function humanize(e) {
   const raw = String(e?.message || e)
   const marker = 'api error '
@@ -176,24 +157,13 @@ function humanize(e) {
   return raw
 }
 
-// Paste-a-block heuristic: if the user pastes a chunk that looks like
-// the output of `aws sts assume-role` or the "access keys" block from
-// the AWS console ("AKIA...\nwJalr...\nIQoJb...\n"), try to split it
-// into the right fields. Keeps the user out of "which line goes where"
-// territory.
+// Paste-a-block heuristic (kept from the original): pasting the
+// multi-line AWS-console credential block splits into the right fields.
 function onPasteBundle(e) {
   const text = (e.clipboardData || window.clipboardData).getData('text') || ''
-  if (!text.includes('\n')) return // not a multiline paste, let the native handler run
-  const lines = text
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean)
+  if (!text.includes('\n')) return
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
   if (lines.length < 2) return
-
-  // Heuristic: exactly one line looks like an access key id (starts
-  // with AKIA/ASIA and is 16–32 chars), treat the next non-empty line
-  // as the secret, and any obvious token line (Base64-ish, >100 chars)
-  // as session token.
   const akIdx = lines.findIndex((l) => /^(AKIA|ASIA)[A-Z0-9]{12,30}$/.test(l))
   if (akIdx < 0) return
   e.preventDefault()
@@ -209,61 +179,87 @@ function onPasteBundle(e) {
 </script>
 
 <template>
-  <div v-if="store.showCredsDialog" class="backdrop" @click.self="close">
-    <div class="dialog" role="dialog" aria-labelledby="awsCredsTitle">
-      <header class="head">
-        <h2 id="awsCredsTitle">AWS credentials</h2>
-        <button class="icon" aria-label="Close" @click="close">×</button>
-      </header>
+  <Transition name="drawer">
+    <div v-if="store.showCredsDialog" class="shell" @click.self="close">
+      <aside class="drawer" role="dialog" aria-labelledby="credsTitle">
+        <!-- Head ————————————————————————————————————————————— -->
+        <header class="head">
+          <div>
+            <p class="eyebrow label">signed session</p>
+            <h2 id="credsTitle" class="display">
+              AWS <em>credentials</em>
+            </h2>
+          </div>
+          <button class="x" aria-label="Close" @click="close">✕</button>
+        </header>
 
-      <div class="body">
+        <!-- Intro ——————————————————————————————————————————— -->
         <p class="intro">
-          ec2hosts uses the standard AWS credentials file at
-          <code>{{ status?.credentialsPath || '%USERPROFILE%\\.aws\\credentials' }}</code>.
-          If you don't have the AWS CLI installed, you can create or update
-          that file here — no extra tooling required.
+          Writes to
+          <code class="mono">{{ status?.credentialsPath || '%USERPROFILE%\\.aws\\credentials' }}</code>
+          — the same file the AWS CLI reads. No extra tooling required.
         </p>
 
-        <!-- Currently-configured state: show it at the top so users
-             with working creds never have to scroll through the form. -->
+        <!-- Currently configured ——————————————————————————— -->
         <section v-if="status?.profileExists" class="current">
-          <div class="current-row">
-            <span class="label">Profile</span>
-            <code>{{ status.activeProfile }}</code>
-          </div>
-          <div class="current-row">
-            <span class="label">Access key</span>
-            <code>{{ status.maskedAccessKeyId }}</code>
-            <span v-if="status.hasSessionToken" class="badge">session token</span>
-          </div>
-          <div v-if="status.region" class="current-row">
-            <span class="label">Region</span>
-            <code>{{ status.region }}</code>
-          </div>
+          <header class="current-head">
+            <span class="label">current session</span>
+            <span class="ok-dot" aria-hidden="true" />
+          </header>
+          <dl class="kv">
+            <div class="kv-row">
+              <dt class="label">Profile</dt>
+              <dd class="mono">{{ status.activeProfile }}</dd>
+            </div>
+            <div class="kv-row">
+              <dt class="label">Access key</dt>
+              <dd class="mono">
+                {{ status.maskedAccessKeyId }}
+                <span v-if="status.hasSessionToken" class="tag">session</span>
+              </dd>
+            </div>
+            <div v-if="status.region" class="kv-row">
+              <dt class="label">Region</dt>
+              <dd class="mono">{{ status.region }}</dd>
+            </div>
+          </dl>
           <div class="current-actions">
             <button :disabled="testing" @click="testExisting">
-              {{ testing ? 'Testing…' : 'Test current credentials' }}
+              {{ testing ? 'verifying…' : 'verify identity' }}
             </button>
-            <a class="link" @click="OpenAWSFolder()">Open ~/.aws folder</a>
+            <a @click="OpenAWSFolder()">
+              <span class="chev">›</span> open ~/.aws
+            </a>
           </div>
-          <div v-if="savedIdentity && !testError" class="ok">
-            ✓ Signed in as <code>{{ savedIdentity.arn }}</code>
-            (account {{ savedIdentity.account }})
+          <div v-if="identity && !testError" class="ok">
+            <span class="glyph">✓</span>
+            <div>
+              <div class="ok-title">authenticated</div>
+              <div class="ok-body">
+                <code class="mono">{{ identity.arn }}</code>
+                <span class="sep">·</span>
+                <span>account {{ identity.account }}</span>
+              </div>
+            </div>
           </div>
-          <div v-if="testError" class="err">{{ testError }}</div>
+          <div v-if="testError" class="err">
+            <span class="glyph">!</span>
+            <div class="err-body">{{ testError }}</div>
+          </div>
         </section>
 
-        <!-- Form for (re)setting credentials. Collapsed header when
-             creds already exist, so we don't push the happy path
-             under a wall of inputs. -->
+        <!-- Form ——————————————————————————————————————————— -->
         <details :open="!status?.profileExists" class="form-wrap">
           <summary>
-            {{ status?.profileExists ? 'Replace credentials' : 'Set up credentials' }}
+            <span class="chev">›</span>
+            <span class="label">
+              {{ status?.profileExists ? 'replace credentials' : 'set up credentials' }}
+            </span>
           </summary>
 
           <div class="form">
             <label>
-              <span class="lbl">Profile name</span>
+              <span class="field-label">Profile name</span>
               <input
                 v-model="profile"
                 type="text"
@@ -272,39 +268,40 @@ function onPasteBundle(e) {
               />
               <span class="hint">
                 Must match <code>aws.profile</code> in your config.yaml
-                (leave as <code>default</code> if you don't use profiles).
+                (or stay <code>default</code>).
               </span>
             </label>
 
             <label>
-              <span class="lbl">Access key ID</span>
+              <span class="field-label">Access key ID</span>
               <input
                 ref="firstInput"
                 v-model="accessKeyId"
                 type="text"
                 autocomplete="off"
                 spellcheck="false"
-                placeholder="AKIA..."
+                placeholder="AKIA…"
                 @paste="onPasteBundle"
               />
             </label>
 
             <label>
-              <span class="lbl">Secret access key</span>
+              <span class="field-label">Secret access key</span>
               <input
                 v-model="secretAccessKey"
                 type="password"
                 autocomplete="off"
                 spellcheck="false"
+                placeholder="••••••••••••••••••••"
               />
               <span class="hint">
-                Stored in plain text at <code>{{ status?.credentialsPath || '~/.aws/credentials' }}</code>,
-                readable only by your user.
+                Stored plain-text in
+                <code>~/.aws/credentials</code>, readable by your user only.
               </span>
             </label>
 
             <label>
-              <span class="lbl">Region</span>
+              <span class="field-label">Region</span>
               <input
                 v-model="region"
                 type="text"
@@ -312,227 +309,383 @@ function onPasteBundle(e) {
                 spellcheck="false"
                 placeholder="eu-west-1"
               />
-              <span class="hint">Written to ~/.aws/config for this profile.</span>
+              <span class="hint">Written to <code>~/.aws/config</code>.</span>
             </label>
 
             <div class="advanced-toggle">
-              <a class="link" @click="showAdvanced = !showAdvanced">
-                {{ showAdvanced ? '▼' : '▶' }} Advanced (session token)
+              <a @click="showAdvanced = !showAdvanced">
+                <span class="chev" :class="{ open: showAdvanced }">›</span>
+                advanced — session token
               </a>
             </div>
             <label v-if="showAdvanced">
-              <span class="lbl">Session token</span>
+              <span class="field-label">Session token</span>
               <textarea
                 v-model="sessionToken"
                 rows="3"
                 autocomplete="off"
                 spellcheck="false"
-              ></textarea>
-              <span class="hint">
-                Required for temporary credentials from STS / SSO.
-                Leave empty for long-lived IAM user keys.
-              </span>
+                placeholder="only for temporary STS / SSO credentials"
+              />
             </label>
 
-            <!-- Two-step flow: Test first (no disk write) so a typo
-                 is caught before we overwrite ~/.aws/credentials. -->
             <div class="cta">
-              <button class="primary" :disabled="!canTest" @click="test">
-                {{ testing ? 'Testing…' : 'Test' }}
+              <button
+                class="primary"
+                :disabled="!canTest"
+                @click="test"
+              >
+                <span class="glyph">▶</span>
+                <span>{{ testing ? 'testing…' : 'test' }}</span>
+                <span class="kbd"><span>step 1</span></span>
               </button>
-              <button class="primary" :disabled="!canSave" @click="save">
-                {{ saving ? 'Saving…' : 'Save' }}
+              <button
+                class="primary"
+                :disabled="!canSave"
+                @click="save"
+              >
+                <span class="glyph">↓</span>
+                <span>{{ saving ? 'saving…' : 'save' }}</span>
+                <span class="kbd"><span>step 2</span></span>
               </button>
-              <button @click="close">Cancel</button>
+              <button @click="close">cancel</button>
             </div>
 
-            <div v-if="savedIdentity && !testError" class="ok">
-              ✓ Credentials valid — signed in as
-              <code>{{ savedIdentity.arn }}</code>
-              (account {{ savedIdentity.account }}).
-              Click <b>Save</b> to write them to disk.
+            <div v-if="identity && !testError && !savedOk" class="ok">
+              <span class="glyph">✓</span>
+              <div>
+                <div class="ok-title">credentials valid</div>
+                <div class="ok-body">
+                  <code class="mono">{{ identity.arn }}</code>
+                  <span class="sep">·</span>
+                  <span>account {{ identity.account }}</span>
+                </div>
+                <div class="ok-hint">click <b>save</b> to write to disk.</div>
+              </div>
             </div>
             <div v-if="savedOk" class="ok">
-              ✓ Saved. You can close this dialog and try <b>Start &amp; apply</b>.
+              <span class="glyph">✓</span>
+              <div>
+                <div class="ok-title">saved</div>
+                <div class="ok-body">
+                  close this drawer and hit <b>Start &amp; apply</b>.
+                </div>
+              </div>
             </div>
-            <div v-if="testError" class="err">{{ testError }}</div>
-            <div v-if="saveError" class="err">{{ saveError }}</div>
+            <div v-if="testError && !identity" class="err">
+              <span class="glyph">!</span>
+              <div class="err-body">{{ testError }}</div>
+            </div>
+            <div v-if="saveError" class="err">
+              <span class="glyph">!</span>
+              <div class="err-body">{{ saveError }}</div>
+            </div>
           </div>
         </details>
-      </div>
+      </aside>
     </div>
-  </div>
+  </Transition>
 </template>
 
 <style scoped>
-.backdrop {
+.shell {
   position: fixed;
   inset: 0;
-  background: rgba(15, 23, 42, 0.4);
-  display: flex;
-  align-items: flex-start;
-  justify-content: center;
   z-index: 1000;
-  padding: 2rem 1rem;
+  display: flex;
+  justify-content: flex-end;
+  background: rgba(8, 7, 6, 0.55);
+  backdrop-filter: blur(2px);
+}
+
+.drawer {
+  position: relative;
+  width: min(520px, 100vw);
+  height: 100%;
+  background: var(--surface-1);
+  border-left: 1px solid var(--line-strong);
   overflow-y: auto;
+  padding: 1.5rem 1.75rem 2rem;
+  box-shadow: -20px 0 40px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 1.2rem;
 }
-.dialog {
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  width: 100%;
-  max-width: 560px;
-  box-shadow: 0 20px 40px rgba(15, 23, 42, 0.15);
+/* A single decorative hairline down the left edge of the drawer, in
+   amber. Signals "this is not main content, it's an inspector" without
+   a huge header bar. */
+.drawer::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 2px;
+  background: var(--amber);
+  opacity: 0.8;
 }
+
+/* ——— Head ————————————————————————————————————————————————— */
+
 .head {
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  padding: 0.9rem 1.2rem;
-  border-bottom: 1px solid var(--border);
-}
-.head h2 { margin: 0; font-size: 1.05rem; }
-button.icon {
-  background: transparent;
-  border: none;
-  font-size: 1.3rem;
-  line-height: 1;
-  padding: 0 0.4rem;
-  color: var(--muted);
-}
-button.icon:hover { color: var(--fg); background: transparent; }
-
-.body {
-  padding: 1.1rem 1.2rem 1.3rem;
-  display: flex;
-  flex-direction: column;
+  align-items: flex-start;
   gap: 1rem;
 }
-.intro {
+.eyebrow { margin: 0 0 0.3rem; color: var(--amber); }
+h2 {
   margin: 0;
-  color: var(--muted);
-  font-size: 0.92rem;
-  line-height: 1.4;
+  font-family: var(--font-display);
+  font-weight: 500;
+  font-size: 28px;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+  font-variation-settings: 'opsz' 144, 'SOFT' 40;
 }
-.intro code {
-  font-size: 0.9em;
-  word-break: break-all;
+h2 em {
+  font-style: italic;
+  color: var(--amber);
+  font-variation-settings: 'opsz' 144, 'SOFT' 100;
+}
+button.x {
+  background: transparent;
+  border: 1px solid var(--line);
+  padding: 0;
+  width: 28px;
+  height: 28px;
+  font-size: 11px;
+  color: var(--ink-3);
+  line-height: 1;
+  text-transform: none;
+  letter-spacing: 0;
+}
+button.x:hover {
+  background: var(--surface-2);
+  color: var(--ink);
+  border-color: var(--line-strong);
 }
 
+/* ——— Intro ——————————————————————————————————————————————— */
+
+.intro {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.intro code { color: var(--ink); word-break: break-all; }
+
+/* ——— Current session panel ————————————————————————————— */
+
 .current {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 0.75rem 0.9rem;
-  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  padding: 0.9rem 1rem 0.95rem;
   display: flex;
   flex-direction: column;
-  gap: 0.4rem;
+  gap: 0.7rem;
 }
-.current-row {
+.current-head {
   display: flex;
+  justify-content: space-between;
   align-items: center;
-  gap: 0.6rem;
-  font-size: 0.92rem;
 }
-.current-row .label {
-  color: var(--muted);
-  min-width: 86px;
+.ok-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--lime);
+  box-shadow: 0 0 8px var(--lime-glow);
+}
+.kv {
+  margin: 0;
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.25rem 1rem;
+}
+.kv-row {
+  display: contents;
+}
+.kv dt { margin: 0; }
+.kv dd {
+  margin: 0;
+  color: var(--ink);
+  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.tag {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  padding: 0.08em 0.45em;
+  background: var(--amber-wash);
+  color: var(--amber);
+  border: 1px solid rgba(232, 162, 59, 0.3);
+  border-radius: 2px;
 }
 .current-actions {
   display: flex;
-  gap: 0.9rem;
   align-items: center;
-  margin-top: 0.3rem;
-}
-.badge {
-  background: var(--warn);
-  color: #fff;
-  border-radius: 10px;
-  font-size: 0.7rem;
-  padding: 0.05rem 0.5rem;
-  letter-spacing: 0.02em;
+  gap: 1rem;
+  font-size: 11px;
 }
 
+/* ——— Form ————————————————————————————————————————————————— */
+
+.form-wrap { border-top: 1px solid var(--line); padding-top: 1rem; }
 .form-wrap summary {
   cursor: pointer;
-  padding: 0.35rem 0;
-  font-weight: 600;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.2rem 0;
 }
-.form-wrap[open] summary {
-  margin-bottom: 0.6rem;
+.form-wrap summary::-webkit-details-marker { display: none; }
+.form-wrap summary .chev {
+  transition: transform 0.2s var(--ease);
+  color: var(--ink-3);
+  font-family: var(--font-mono);
 }
+.form-wrap[open] summary .chev { transform: rotate(90deg); }
+
 .form {
   display: flex;
   flex-direction: column;
-  gap: 0.8rem;
+  gap: 0.9rem;
+  margin-top: 0.8rem;
 }
 .form label {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
-  font-size: 0.92rem;
+  gap: 0.3rem;
 }
-.form .lbl {
-  font-weight: 500;
+.field-label {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ink-3);
 }
-.form .hint {
-  color: var(--muted);
-  font-size: 0.82rem;
-  line-height: 1.35;
+.hint {
+  color: var(--ink-3);
+  font-size: 11px;
+  line-height: 1.45;
 }
-.form input,
-.form textarea {
-  font: inherit;
-  font-family: Consolas, Menlo, monospace;
-  padding: 0.45rem 0.6rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: #fff;
-  color: var(--fg);
+.hint code {
+  color: var(--ink-2);
+  background: var(--surface-2);
+  padding: 0.05em 0.35em;
+  border-radius: 2px;
 }
-.form input:focus,
-.form textarea:focus {
-  outline: none;
-  border-color: var(--accent);
-  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.18);
-}
-.form textarea { resize: vertical; min-height: 4.5em; }
 
-.advanced-toggle { font-size: 0.88rem; }
-.advanced-toggle .link { user-select: none; }
+.advanced-toggle { font-size: 11px; }
+.advanced-toggle a {
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  font-size: 10.5px;
+  border-bottom: none;
+}
+.advanced-toggle a:hover { color: var(--amber); }
+.advanced-toggle .chev {
+  font-family: var(--font-mono);
+  transition: transform 0.2s var(--ease);
+}
+.advanced-toggle .chev.open { transform: rotate(90deg); }
 
 .cta {
   display: flex;
-  gap: 0.5rem;
   flex-wrap: wrap;
+  gap: 0.5rem;
   margin-top: 0.4rem;
 }
+.cta button .glyph {
+  font-size: 9px;
+  color: inherit;
+}
+.cta button .kbd {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
 
+/* ——— Banners (ok / err) ——————————————————————————————————— */
+
+.ok, .err {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.7rem 0.85rem;
+  border-radius: var(--radius);
+  font-size: 12px;
+  line-height: 1.5;
+}
 .ok {
-  color: var(--success);
-  background: #f0fdf4;
-  border: 1px solid #bbf7d0;
-  border-radius: 6px;
-  padding: 0.55rem 0.75rem;
-  font-size: 0.9rem;
+  color: var(--lime-glow);
+  background: var(--lime-wash);
+  border: 1px solid rgba(185, 220, 91, 0.25);
 }
 .err {
-  color: var(--danger);
-  background: #fef2f2;
-  border: 1px solid #fecaca;
-  border-radius: 6px;
-  padding: 0.55rem 0.75rem;
-  font-size: 0.9rem;
-  font-family: Consolas, Menlo, monospace;
+  color: var(--ember-hot);
+  background: var(--ember-wash);
+  border: 1px solid rgba(232, 100, 69, 0.3);
+  font-family: var(--font-mono);
   word-break: break-word;
 }
-.link { cursor: pointer; color: var(--accent); font-size: 0.9rem; }
-.link:hover { text-decoration: underline; }
-code {
-  background: var(--panel);
-  padding: 0.08em 0.35em;
-  border-radius: 4px;
-  font-family: Consolas, Menlo, monospace;
-  font-size: 0.9em;
+.ok .glyph, .err .glyph {
+  flex-shrink: 0;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid currentColor;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  translate: 0 1px;
 }
+.ok-title {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--lime);
+  margin-bottom: 0.15rem;
+}
+.ok-body { color: var(--ink-2); font-size: 11.5px; }
+.ok-body code { color: var(--ink); }
+.ok-body .sep { color: var(--ink-4); margin: 0 0.35rem; }
+.ok-hint { color: var(--ink-3); font-size: 11px; margin-top: 0.25rem; }
+
+.err-body { color: var(--ember-hot); font-size: 11.5px; }
+
+.chev { font-family: var(--font-mono); color: var(--ink-3); }
+
+code {
+  font-family: var(--font-mono);
+  color: var(--ink);
+  font-size: 11.5px;
+}
+
+/* ——— Transition ——————————————————————————————————————————— */
+
+.drawer-enter-active, .drawer-leave-active {
+  transition: background 0.22s var(--ease);
+}
+.drawer-enter-active .drawer, .drawer-leave-active .drawer {
+  transition: transform 0.28s var(--ease-out), opacity 0.28s var(--ease-out);
+}
+.drawer-enter-from { background: transparent; }
+.drawer-enter-from .drawer { transform: translateX(40px); opacity: 0; }
+.drawer-leave-to { background: transparent; }
+.drawer-leave-to .drawer { transform: translateX(40px); opacity: 0; }
 </style>
