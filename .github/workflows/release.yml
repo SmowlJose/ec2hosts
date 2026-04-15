@@ -85,6 +85,14 @@ jobs:
           # And the example config is seeded from a file next to the .nsi.
           cp config.yaml.example cmd/gui/build/windows/installer/config.yaml.example
 
+      - name: Install NSIS
+        # Wails v2 -nsis shells out to `makensis`. GitHub's windows-latest
+        # image does not ship it by default, so we add it via Chocolatey
+        # (pre-installed on the runner).
+        run: |
+          choco install nsis -y --no-progress
+          echo "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append
+
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.9.2
 
