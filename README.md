@@ -67,15 +67,32 @@ GOOS=darwin  GOARCH=arm64 go build -o dist/ec2hosts-darwin-arm64  ./cmd/cli
 GOOS=windows GOARCH=amd64 go build -o dist/ec2hosts-windows-amd64.exe ./cmd/cli
 ```
 
-Build the Windows GUI (run on Windows, requires Go + Node + [Wails v2](https://wails.io)):
+Build the Windows GUI (run on Windows, requires Go + Node +
+[Wails v2](https://wails.io) + [NSIS](https://nsis.sourceforge.io) on
+your `PATH`). There's a helper script that stages the CLI binary and
+the config example exactly where `project.nsi` expects them — running
+`wails build -nsis` directly without this staging aborts on
+`project.nsi` line 73 with "no files found".
 
 ```powershell
-go install github.com/wailsapp/wails/v2/cmd/wails@v2.9.2
-cd cmd/gui
-wails build -platform windows/amd64 -nsis
+# One-time setup
+go install github.com/wailsapp/wails/v2/cmd/wails@latest
+
+# Build GUI + installer
+.\scripts\build-installer.ps1
+
+# Or: GUI only, no NSIS
+.\scripts\build-installer.ps1 -SkipInstaller
+
+# Or: wipe cmd\gui\build\bin first
+.\scripts\build-installer.ps1 -Clean
 ```
 
-Output lands in `cmd/gui/build/bin/`.
+Output lands in `cmd/gui/build/bin/`:
+
+- `ec2hosts-gui.exe` — Wails GUI
+- `ec2hosts.exe` — CLI (installed alongside for UAC elevation)
+- `ec2hosts-amd64-installer.exe` — NSIS installer
 
 ## Quick start
 
