@@ -11,7 +11,22 @@ managing a single delimited block inside the system `hosts` file.
 Download the binary for your OS/arch from the
 [Releases page](https://github.com/SmowlJose/ec2hosts/releases).
 
-**Linux / macOS**
+**Linux / macOS — one-liner (recommended)**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SmowlJose/ec2hosts/main/install.sh | bash
+```
+
+The installer downloads the right binary for your OS/arch, drops it in
+`/usr/local/bin` (or `~/.local/bin` as a fallback), wires the install
+dir onto `PATH` for `bash`/`zsh` if needed, and seeds
+`~/.config/ec2hosts/config.yaml` from the example on first install.
+Existing configs are never overwritten.
+
+Override with `EC2HOSTS_VERSION=v1.2.3`, `EC2HOSTS_BIN_DIR=~/bin`,
+`EC2HOSTS_NO_PATH=1`, or `EC2HOSTS_NO_CONFIG=1` as needed.
+
+**Linux / macOS — manual**
 
 ```bash
 # pick the right asset for your platform
